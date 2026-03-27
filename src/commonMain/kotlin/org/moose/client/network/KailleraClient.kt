@@ -20,10 +20,15 @@ import org.moose.client.data.MooseGame
 import org.moose.client.data.MooseUser
 
 class KailleraClient(private val coroutineScope: CoroutineScope) {
+    companion object {
+        const val DEFAULT_ENCODING = "Shift_JIS"
+    }
+    
     private val selectorManager = SelectorManager(Dispatchers.IO)
     private var socket: ConnectedDatagramSocket? = null
     
     private var messageIdCounter = 0
+    private var lastReceivedMessageNumber = -1
     private var username: String = ""
     
     // UI State exposed
@@ -75,6 +80,7 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
         val sessionSocket = aSocket(selectorManager).udp().connect(serverAddress)
         socket = sessionSocket
         
+        lastReceivedMessageNumber = -1
         val userInfo = UserInformation(++messageIdCounter, username, "Moose KMP Client", ConnectionType.LAN)
         sendBundle(V086Bundle.Single(userInfo))
 
@@ -83,10 +89,21 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
                 while (isActive) {
                     val datagram = sessionSocket.receive()
                     val bytes = datagram.packet.readBytes()
+                    
+                    if (bytes.size == 5 && 
+                        bytes[0] == 'P'.code.toByte() && bytes[1] == 'I'.code.toByte() && 
+                        bytes[2] == 'N'.code.toByte() && bytes[3] == 'G'.code.toByte() && 
+                        bytes[4] == 0.toByte()
+                    ) {
+                        val pongData = byteArrayOf('P'.code.toByte(), 'O'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 0.toByte())
+                        sessionSocket.send(Datagram(io.ktor.utils.io.core.ByteReadPacket(pongData), serverAddress))
+                        continue
+                    }
+                    
                     val source = Buffer().apply { write(bytes) }
                     
                     try {
-                        val receivedBundle = V086BundleSerializer.read(source, -1, "ISO-8859-1")
+                        val receivedBundle = V086BundleSerializer.read(source, lastReceivedMessageNumber, DEFAULT_ENCODING)
                         handleBundle(receivedBundle, onConnected)
                     } catch (e: Exception) {
                         println("Failed to parse bundle: ${e.message}")
@@ -101,7 +118,7 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
     private suspend fun sendBundle(bundle: V086Bundle) {
         writeProtocolLog("OUTGOING: $bundle")
         val buffer = Buffer()
-        V086BundleSerializer.write(buffer, bundle, "ISO-8859-1")
+        V086BundleSerializer.write(buffer, bundle, DEFAULT_ENCODING)
         val bytes = buffer.readByteArray()
         socket?.send(Datagram(io.ktor.utils.io.core.ByteReadPacket(bytes), socket!!.remoteAddress))
     }
@@ -114,6 +131,9 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
         }
         
         for (msg in messages) {
+            if (msg.messageNumber > lastReceivedMessageNumber) {
+                lastReceivedMessageNumber = msg.messageNumber
+            }
             when (msg) {
                 is ServerAck -> {
                     sendBundle(V086Bundle.Single(ClientAck(++messageIdCounter)))
@@ -125,6 +145,9 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
                 }
                 is QuitNotification -> {
                     _users.value = _users.value.filter { it.username != msg.username }
+                    _games.value = _games.value.map { game ->
+                        game.copy(players = game.players.filter { it.username != msg.username })
+                    }
                 }
                 is ChatNotification -> {
                     val sender = _users.value.find { it.username == msg.username }
@@ -135,13 +158,54 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
                         type = MessageType.USER_TEXT
                     )
                 }
+                is ServerStatus -> {
+                    _users.value = msg.users.map { MooseUser(it.username, AccessLevel.USER) }
+                    _games.value = msg.games.map { 
+                        MooseGame(
+                            it.gameId.toString(), 
+                            it.romName, 
+                            it.gameStatus, 
+                            listOf(MooseUser(it.username, AccessLevel.USER))
+                        ) 
+                    }
+                }
                 // Handle basic game states
                 is CreateGameNotification -> {
-                    val game = MooseGame(msg.gameId.toString(), "Game ${msg.gameId}", io.github.hopskipnfall.kaillera.protocol.model.GameStatus.WAITING, emptyList())
+                    val owner = _users.value.find { it.username == msg.username } ?: MooseUser(msg.username, AccessLevel.USER)
+                    val game = MooseGame(
+                        msg.gameId.toString(), 
+                        msg.romName, 
+                        io.github.hopskipnfall.kaillera.protocol.model.GameStatus.WAITING, 
+                        listOf(owner)
+                    )
                     _games.value = (_games.value + game).distinctBy { it.id }
                 }
                 is CloseGame -> {
                     _games.value = _games.value.filter { it.id != msg.gameId.toString() }
+                }
+                is JoinGameNotification -> {
+                    _games.value = _games.value.map { game ->
+                        if (game.id == msg.gameId.toString()) {
+                            val user = _users.value.find { it.username == msg.username } ?: MooseUser(msg.username, AccessLevel.USER)
+                            game.copy(players = (game.players + user).distinctBy { it.username })
+                        } else game
+                    }
+                }
+                is io.github.hopskipnfall.kaillera.protocol.v086.GameStatus -> {
+                    _games.value = _games.value.map { game ->
+                        if (game.id == msg.gameId.toString()) {
+                            game.copy(status = msg.gameStatus)
+                        } else game
+                    }
+                }
+                is StartGameNotification -> {
+                    // StartGame is sent to players within the room when it kicks off.
+                    val myUsername = username
+                    _games.value = _games.value.map { game ->
+                        if (game.players.any { it.username == myUsername }) {
+                            game.copy(status = io.github.hopskipnfall.kaillera.protocol.model.GameStatus.PLAYING)
+                        } else game
+                    }
                 }
             }
         }
@@ -154,7 +218,17 @@ class KailleraClient(private val coroutineScope: CoroutineScope) {
     }
 
     fun disconnect() {
-        socket?.close()
-        socket = null
+        coroutineScope.launch {
+            try {
+                if (socket != null) {
+                    sendBundle(V086Bundle.Single(QuitRequest(++messageIdCounter, "Client Closed")))
+                }
+            } catch (e: Exception) {
+                // Ignore specific exceptions when closing
+            } finally {
+                socket?.close()
+                socket = null
+            }
+        }
     }
 }

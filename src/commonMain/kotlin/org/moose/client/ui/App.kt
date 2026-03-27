@@ -3,10 +3,8 @@ package org.moose.client.ui
 import androidx.compose.runtime.*
 
 @Composable
-fun App() {
+fun App(client: org.moose.client.network.KailleraClient) {
     MooseTheme {
-        val coroutineScope = rememberCoroutineScope()
-        val client = remember { org.moose.client.network.KailleraClient(coroutineScope) }
         var isLoggedIn by remember { mutableStateOf(false) }
 
         if (isLoggedIn) {

@@ -70,6 +70,16 @@ fun ChatArea(modifier: Modifier = Modifier, title: String = "#server-chat", mess
                         }
                     }
                 ),
+                trailingIcon = {
+                    TextButton(onClick = {
+                        if (inputText.isNotBlank()) {
+                            onSendMessage(inputText)
+                            inputText = ""
+                        }
+                    }) {
+                        Text("Send", color = LightPurple, fontWeight = FontWeight.Bold)
+                    }
+                },
                 colors = TextFieldDefaults.outlinedTextFieldColors(
                     textColor = Color.White,
                     focusedBorderColor = Color.Transparent,
