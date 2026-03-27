@@ -145,7 +145,7 @@ fun UserSidebar(
             }
         }
 
-        val playingGames = games.filter { it.status == GameStatus.PLAYING }
+        val playingGames = games.filter { it.status == GameStatus.PLAYING || it.status == GameStatus.SYNCHRONIZING }
         if (playingGames.isNotEmpty()) {
             item {
                 Spacer(modifier = Modifier.height(16.dp))
